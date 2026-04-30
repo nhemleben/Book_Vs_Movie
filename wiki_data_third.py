@@ -1,34 +1,40 @@
 
 import requests
 import math
+import pandas as pd
+import csv
+import os
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
 OPEN_LIBRARY_WORK = "https://openlibrary.org"
 
-def get_editions(work_key):
-    url = f"https://openlibrary.org{work_key}/editions.json"
-    r = requests.get(url)
+GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
+GOOGLE_BOOKS_API_KEY = "AIzaSyD1VtIwjaYaOfs4gW6nDsJf9P0RPOth0zY"  # Replace with your actual key
 
-    if r.status_code != 200:
-        return []
+def google_search_book(title):
+    url = "https://www.googleapis.com/books/v1/volumes"
+    params = {"q": title, "key": GOOGLE_BOOKS_API_KEY}
 
-    return r.json().get("entries", [])
+    r = requests.get(url, params=params)
+    return r.json()
 
 
-def extract_ratings(editions):
+def extract_ratings(items):
     ratings = []
 
-    for e in editions:
-        r = e.get("ratings_average")
-        c = e.get("ratings_count")
+    for item in items:
+        info = item.get("volumeInfo", {})
 
-        if r is not None and c:
-            ratings.append((r, c))
+        rating = info.get("averageRating")
+        count = info.get("ratingsCount", 0)
+
+        if rating is not None and count > 0:
+            ratings.append((2*rating, count)) #double the rating to convert from 0-5 to 0-10 scale
 
     return ratings
 
 
-def aggregate(ratings):
+def weighted_rating(ratings):
     if not ratings:
         return None
 
@@ -36,11 +42,15 @@ def aggregate(ratings):
     if total_weight == 0:
         return None
 
-    weighted = sum(r * c for r, c in ratings) / total_weight
-    return weighted
+    return sum(r * c for r, c in ratings) / total_weight
 
 
 
+def compute_book_rating(data):
+    items = data.get("items", [])
+
+    ratings = extract_ratings(items)
+    return weighted_rating(ratings)
 
 
 
@@ -168,7 +178,9 @@ def get_adaptations_wikidata(book_qid):
     for item in data["results"]["bindings"]:
         results.append({
             "title": item["adaptationLabel"]["value"],
-            "imdb_id": item.get("imdb", {}).get("value")
+            "imdb_id": item.get("imdb", {}).get("value"),
+            'url': item["adaptation"]["value"],
+            'url_ending': item["adaptation"]["value"].split("/")[-1]  # Extract QID for potential future use
         })
 
     return results
@@ -178,7 +190,7 @@ def get_derivative_works(qid):
     url = "https://query.wikidata.org/sparql"
 
     query = f"""
-    SELECT ?work ?workLabel ?type WHERE {{
+    SELECT ?work ?workLabel ?type (YEAR(?date) AS ?year) WHERE {{
       {{
         ?work wdt:P144 wd:{qid} .
         BIND("based_on" AS ?type)
@@ -206,6 +218,7 @@ def get_derivative_works(qid):
         results.append({
             "title": item["workLabel"]["value"],
             "type": item["type"]["value"],
+            "year": item["work"]["value"],
             "imdb_id": item.get("imdb", {}).get("value")
         })
 
@@ -238,57 +251,6 @@ def normalize_rating(r):
         return None
     return r * 2  # convert to 0–10 scale
 
-# ----------------------------
-# Step 3: Weighted sentiment score
-# ----------------------------
-def compute_sentiment(rating, count):
-    if rating is None:
-        return None
-
-    return rating * math.log10(count + 1)
-
-def analyze_book(title):
-    book = find_book(title)
-
-    print(book)
-
-    if not book:
-        print("Book not found.")
-        return
-
-
-    editions = get_editions(book["key"])
-    ratings = extract_ratings(editions)
-
-    avg = aggregate(ratings)
-
-    print("\n📊 Aggregated rating:", avg)
-    print("📦 Edition count with ratings:", len(ratings))
-
-    return avg
-
-#    rating_5 = book["ratings_average"]
-#    rating_10 = normalize_rating(rating_5)
-#    count = book["ratings_count"]
-#
-#    sentiment = compute_sentiment(rating_10, count)
-#
-#    print(f"\n📚 {book['title']}")
-#    print(f"Open Library rating: {rating_5}/5")
-#    print(f"Normalized rating: {rating_10}/10")
-#    print(f"Ratings count: {count}")
-#    if sentiment is None:
-#        print("Sentiment score: N/A")
-#    else:
-#        print(f"Sentiment score: {sentiment:.2f}")
-#
-#    return {
-#        "title": book["title"],
-#        "rating_10": rating_10,
-#        "ratings_count": count,
-#        "sentiment": sentiment
-#    }
-
 
 
 
@@ -312,21 +274,41 @@ def get_rating(imdb_id):
 def compare_book_vs_adaptations(book_title):
     print(f"\n📚 Book: {book_title}")
 
-    real_book_data = analyze_book(book_title)
+    #real_book_data = analyze_book(book_title)
+    google_book_data = google_search_book(book_title)
+#    print("\n🔍 Google Books search result:")
+
+    #google_vol_info = google_book_data["items"][0]["volumeInfo"]
+    #Sample of top book and review
+#    print(google_vol_info["title"])
+#    print(google_vol_info['averageRating'])
+#    print(google_vol_info['ratingsCount'])
+
+    if not google_book_data.get("items"):
+        print("No Google Books data found.")
+        return
+
+    ratings = extract_ratings(google_book_data["items"])
+    weighted_ratings = weighted_rating(ratings)
+    if not weighted_ratings:
+        print("No Google Books ratings found.")
+        weighted_ratings = -1
+
+    print(f"Weighted Google Books rating: {(weighted_ratings):.2f}/10")
+
+
 
     book_qid = get_wikidata_id(book_title)
-    novel_qid = get_novel_qid(book_title)
+#    novel_qid = get_novel_qid(book_title)
 
-    if not book_qid and not novel_qid:
+    if not book_qid:
         print("Book not found in Wikidata.")
         return
 
     print(f"Wikidata ID: {book_qid}")
-    print(f"Wikidata novel ID: {novel_qid}")
 
     adaptations = get_adaptations_wikidata(book_qid)
-#    novel_adaptations = get_adaptations_wikidata(novel_qid)
-    derivations = get_derivative_works(book_qid)
+    #derivations = get_derivative_works(book_qid)
 
     if not adaptations:
         print("No book adaptations found via P144.")
@@ -339,7 +321,7 @@ def compare_book_vs_adaptations(book_title):
     for a in adaptations:
         rating = get_rating(a["imdb_id"])
         if rating:
-            scored.append((a["title"], rating))
+            scored.append((a["title"], a['url'], rating))
 
 # Derivations code if interested in exploring works that are based on or inspired by the original
 # book, which may not be direct adaptations but still relevant to the discussion. 
@@ -349,25 +331,53 @@ def compare_book_vs_adaptations(book_title):
 #        if rating:
 #            scored.append((a["title"], rating))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    scored.sort(key=lambda x: x[2], reverse=True)
 
     print("\n🏆 Ranked adaptations:")
-    for title, rating in scored:
-        print(f"{title}: {rating}/10")
+    for title, url, rating in scored:
+        print(f"{title} ({url}): {rating}/10")
+
+    write_adaptations_to_csv(book_title, weighted_ratings, scored)
+
+
+def write_adaptations_to_csv(source, book_score, scored, csv_path="adaptations_with_ratings.csv"):
+    """
+    Write a list of (title, url, rating) tuples to a CSV file.
+    """
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, mode="a", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["source", "source_score", "title", "url", "rating"])
+
+        for title, url, rating in scored:
+            writer.writerow([source, book_score, title, url, rating])
+
+
+def load_book_titles_from_csv(csv_path="books_with_adaptations.csv"):
+    """
+    Load all book titles from the given CSV file.
+    Returns a list of titles.
+    """
+    df = pd.read_csv(csv_path)
+    return df["book"].tolist()
 
 
 # ----------------------------
 # Run
 # ----------------------------
 if __name__ == "__main__":
-    
-    properties_to_check = [
-        "Dune",
-        "Goodfellas",
-        "The Lord of the Rings",
-        "The Great Gatsby",
-        "The Shining",
-    ]
 
-    property_to_check = properties_to_check[0]  # Change index to test different books
-    compare_book_vs_adaptations(property_to_check)
+    properties_to_check = load_book_titles_from_csv()
+
+    # properties_to_check = [
+    #     "Dune",
+    #     "Harry Potter and the Sorcerer's Stone",
+    #     "The Lord of the Rings",
+    #     "The Great Gatsby",
+    #     "The Shining",
+    # ]
+    #property_to_check = properties_to_check[0]  # Change index to test different books
+
+    for property_to_check in properties_to_check:
+        compare_book_vs_adaptations(property_to_check)
