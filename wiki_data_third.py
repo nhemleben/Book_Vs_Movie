@@ -4,6 +4,8 @@ import math
 import pandas as pd
 import csv
 import os
+from threading import Thread
+import time
 
 OPEN_LIBRARY_SEARCH = "https://openlibrary.org/search.json"
 OPEN_LIBRARY_WORK = "https://openlibrary.org"
@@ -16,6 +18,9 @@ def google_search_book(title):
     params = {"q": title, "key": GOOGLE_BOOKS_API_KEY}
 
     r = requests.get(url, params=params)
+    if r.status_code == 429:
+        print("Rate limit hit for Google Books. Waiting before retrying...")
+        return None
     return r.json()
 
 
@@ -265,6 +270,11 @@ def get_rating(imdb_id):
     url = f"http://www.omdbapi.com/?i={imdb_id}&apikey={OMDB_API_KEY}"
     data = requests.get(url).json()
 
+    # Check for OMDb API rate limit
+    if data.get("Response") == "False" and data.get("Error") == "Request limit reached!":
+        print("OMDb API request limit reached! Please wait until the next UTC day for reset.")
+        return None
+
     if data.get("imdbRating") and data["imdbRating"] != "N/A":
         return float(data["imdbRating"])
 
@@ -276,17 +286,10 @@ def compare_book_vs_adaptations(book_title):
 
     #real_book_data = analyze_book(book_title)
     google_book_data = google_search_book(book_title)
-#    print("\n🔍 Google Books search result:")
-
-    #google_vol_info = google_book_data["items"][0]["volumeInfo"]
-    #Sample of top book and review
-#    print(google_vol_info["title"])
-#    print(google_vol_info['averageRating'])
-#    print(google_vol_info['ratingsCount'])
 
     if not google_book_data.get("items"):
         print("No Google Books data found.")
-        return
+        return False
 
     ratings = extract_ratings(google_book_data["items"])
     weighted_ratings = weighted_rating(ratings)
@@ -296,23 +299,19 @@ def compare_book_vs_adaptations(book_title):
 
     print(f"Weighted Google Books rating: {(weighted_ratings):.2f}/10")
 
-
-
     book_qid = get_wikidata_id(book_title)
-#    novel_qid = get_novel_qid(book_title)
 
     if not book_qid:
         print("Book not found in Wikidata.")
-        return
+        return False
 
     print(f"Wikidata ID: {book_qid}")
 
     adaptations = get_adaptations_wikidata(book_qid)
-    #derivations = get_derivative_works(book_qid)
 
     if not adaptations:
         print("No book adaptations found via P144.")
-        return
+        return False
 
     print("\n🎬 Adaptations (Wikidata P144):")
 
@@ -322,14 +321,8 @@ def compare_book_vs_adaptations(book_title):
         rating = get_rating(a["imdb_id"])
         if rating:
             scored.append((a["title"], a['url'], rating))
-
-# Derivations code if interested in exploring works that are based on or inspired by the original
-# book, which may not be direct adaptations but still relevant to the discussion. 
-# Uncomment if you want to include these as well.
-#    for a in derivations:
-#        rating = get_rating(a["imdb_id"])
-#        if rating:
-#            scored.append((a["title"], rating))
+        else:
+            scored.append((a["title"], a['url'], -1))  # Use -1 to indicate no rating found
 
     scored.sort(key=lambda x: x[2], reverse=True)
 
@@ -338,6 +331,7 @@ def compare_book_vs_adaptations(book_title):
         print(f"{title} ({url}): {rating}/10")
 
     write_adaptations_to_csv(book_title, weighted_ratings, scored)
+    return True  # Indicate success
 
 
 def write_adaptations_to_csv(source, book_score, scored, csv_path="adaptations_with_ratings.csv"):
@@ -363,6 +357,34 @@ def load_book_titles_from_csv(csv_path="books_with_adaptations.csv"):
     return df["book"].tolist()
 
 
+def compare_book_with_timeout(book_title):
+    for attempt in range(2):
+        try:
+            # Run with timeout
+
+            result = [False]
+            def target(book_title=book_title):
+                result[0] = compare_book_vs_adaptations(book_title)
+
+            t = Thread(target=target)
+            t.start()
+            t.join(timeout=5)
+            if t.is_alive():
+                print(f"Timeout for {book_title} (attempt {attempt+1})")
+                t.join(0)  # Try to clean up thread
+            elif result[0]:
+                break  # Success
+            else:
+                print(f"Failed to process {book_title} (attempt {attempt+1})")
+        except Exception as e:
+            print(f"Exception during attempt {attempt+1} for {book_title}: {e}")
+    else:
+        print(f"Skipped {book_title} after two timeouts.")
+
+
+
+
+
 # ----------------------------
 # Run
 # ----------------------------
@@ -379,5 +401,16 @@ if __name__ == "__main__":
     # ]
     #property_to_check = properties_to_check[0]  # Change index to test different books
 
-    for property_to_check in properties_to_check:
-        compare_book_vs_adaptations(property_to_check)
+
+    #properties_to_check = ["The Three Musketeers"]
+
+    last_ran = "Ach wie flüchtig, ach wie nichtig"
+    start_index = 1 + properties_to_check.index(last_ran)  # Find the index of the last ran book to resume from there
+
+
+    start_index = 0  # For testing, start from the beginning
+    properties_to_check = ["Estoria de España"]
+
+    for property_to_check in properties_to_check[start_index:]:
+        #compare_book_vs_adaptations(property_to_check)
+        compare_book_with_timeout(property_to_check)
